@@ -53,7 +53,7 @@ void nativeEnsureInitialized({String? libmpv}) {
 /// NativePlayer
 /// ------------
 ///
-/// Native based implementation of [PlatformPlayer].
+/// Native implementation of [PlatformPlayer].
 ///
 /// {@endtemplate}
 class NativePlayer extends PlatformPlayer {
@@ -146,8 +146,7 @@ class NativePlayer extends PlatformPlayer {
       }
 
       // Keep these [Media] objects in memory.
-      current.clear();
-      current.addAll(playlist);
+      current = playlist;
 
       // NOTE: Handled as part of [stop] logic.
       // final commands = [
@@ -487,6 +486,7 @@ class NativePlayer extends PlatformPlayer {
 
       // This condition is specifically for the case when the internal playlist is ended (with [PlaylistLoopMode.none]), and we want to play the playlist again if play/pause is pressed.
       if (state.completed) {
+        await seek(Duration.zero, synchronized: false);
         final name = 'playlist-pos'.toNativeUtf8();
         final value = calloc<Int64>()..value = 0;
         mpv.mpv_set_property(
@@ -523,8 +523,10 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
 
-      // Keep this [Media] object in memory.
+      // External List<Media>:
+      // ---------------------------------------------
       current.add(media);
+      // ---------------------------------------------
 
       final command = 'loadfile ${media.uri} append'.toNativeUtf8();
       mpv.mpv_command_string(
@@ -550,6 +552,11 @@ class NativePlayer extends PlatformPlayer {
       }
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
+
+      // External List<Media>:
+      // ---------------------------------------------
+      current.removeAt(index);
+      // ---------------------------------------------
 
       // If we remove the last item in the playlist while playlist mode is none or single, then playback will stop.
       // In this situation, the playlist doesn't seem to be updated, so we manually update it.
@@ -705,6 +712,19 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
 
+      // External List<Media>:
+      // ---------------------------------------------
+      final map = SplayTreeMap<double, Media>.from(
+        current.asMap().map((key, value) => MapEntry(key * 1.0, value)),
+      );
+      final item = map.remove(from * 1.0);
+      if (item != null) {
+        map[to - 0.5] = item;
+      }
+      final values = map.values.toList();
+      current = values;
+      // ---------------------------------------------
+
       final command = 'playlist-move $from $to'.toNativeUtf8();
       mpv.mpv_command_string(
         ctx,
@@ -844,17 +864,40 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
 
-      final name = 'volume'.toNativeUtf8();
-      final value = calloc<Double>();
-      value.value = volume;
-      mpv.mpv_set_property(
-        ctx,
-        name.cast(),
-        generated.mpv_format.MPV_FORMAT_DOUBLE,
-        value.cast(),
-      );
-      calloc.free(name);
-      calloc.free(value);
+      {
+        final name = 'mute'.toNativeUtf8();
+        final value = calloc<Bool>();
+        mpv.mpv_get_property(
+          ctx,
+          name.cast(),
+          generated.mpv_format.MPV_FORMAT_FLAG,
+          value.cast(),
+        );
+        if (value.value) {
+          // Unmute the player before setting the volume.
+          final command = 'cycle mute'.toNativeUtf8();
+          mpv.mpv_command_string(
+            ctx,
+            command.cast(),
+          );
+          calloc.free(command);
+        }
+        calloc.free(name);
+        calloc.free(value);
+      }
+      {
+        final name = 'volume'.toNativeUtf8();
+        final value = calloc<Double>();
+        value.value = volume;
+        mpv.mpv_set_property(
+          ctx,
+          name.cast(),
+          generated.mpv_format.MPV_FORMAT_DOUBLE,
+          value.cast(),
+        );
+        calloc.free(name);
+        calloc.free(value);
+      }
     }
 
     if (synchronized) {
@@ -1426,6 +1469,22 @@ class NativePlayer extends PlatformPlayer {
     mpv.mpv_unobserve_property(ctx, reply);
   }
 
+  /// Invokes command for the internal libmpv instance of this [Player].
+  /// Please use this method only if you know what you are doing, existing methods in [Player] implementation are suited for the most use cases.
+  ///
+  /// See:
+  /// * https://mpv.io/manual/master/#list-of-input-commands
+  ///
+  Future<void> command(List<String> command) async {
+    if (disposed) {
+      throw AssertionError('[Player] has been disposed');
+    }
+    await waitForPlayerInitialization;
+    await waitForVideoControllerInitializationIfAttached;
+
+    await _command(command);
+  }
+
   Future<void> _handler(Pointer<generated.mpv_event> event) async {
     if (event.ref.event_id ==
         generated.mpv_event_id.MPV_EVENT_PROPERTY_CHANGE) {
@@ -1652,6 +1711,24 @@ class NativePlayer extends PlatformPlayer {
             }
           }
         }
+
+        // Populate start & end attributes from [current].
+        try {
+          playlist = playlist
+              .asMap()
+              .map(
+                (i, e) => MapEntry(
+                  i,
+                  e.copyWith(start: current[i].start, end: current[i].end),
+                ),
+              )
+              .values
+              .toList();
+        } catch (exception, stacktrace) {
+          print(exception.toString());
+          print(stacktrace.toString());
+        }
+
         if (index >= 0) {
           state = state.copyWith(
             playlist: Playlist(
@@ -2224,6 +2301,67 @@ class NativePlayer extends PlatformPlayer {
           print(exception);
           print(stacktrace);
         }
+        // Handle start & end position specified in the [Media].
+        try {
+          final name = 'playlist-pos'.toNativeUtf8();
+          final value = calloc<Int64>();
+          value.value = -1;
+
+          mpv.mpv_get_property(
+            ctx,
+            name.cast(),
+            generated.mpv_format.MPV_FORMAT_INT64,
+            value.cast(),
+          );
+
+          final index = value.value;
+
+          calloc.free(name.cast());
+          calloc.free(value.cast());
+
+          if (index >= 0) {
+            final start = current[index].start;
+            final end = current[index].end;
+
+            if (start != null) {
+              try {
+                final property = 'start'.toNativeUtf8();
+                final value = start.inSeconds.toString().toNativeUtf8();
+                mpv.mpv_set_property_string(
+                  ctx,
+                  property.cast(),
+                  value.cast(),
+                );
+                calloc.free(property);
+                calloc.free(value);
+              } catch (exception, stacktrace) {
+                print(exception);
+                print(stacktrace);
+              }
+            }
+
+            if (end != null) {
+              try {
+                final property = 'end'.toNativeUtf8();
+                final value = end.inSeconds.toString().toNativeUtf8();
+                mpv.mpv_set_property_string(
+                  ctx,
+                  property.cast(),
+                  value.cast(),
+                );
+                calloc.free(property);
+                calloc.free(value);
+              } catch (exception, stacktrace) {
+                print(exception);
+                print(stacktrace);
+              }
+            }
+          }
+        } catch (exception, stacktrace) {
+          print(exception);
+          print(stacktrace);
+        }
+        // --------------------------------------------------
         mpv.mpv_hook_continue(
           ctx,
           prop.ref.id,
@@ -2240,14 +2378,44 @@ class NativePlayer extends PlatformPlayer {
           }
         }
         // --------------------------------------------------
-        // Set http-header-fields as empty [generated.mpv_node].
+        // Set http-header-fields as [generated.mpv_format.MPV_FORMAT_NONE] [generated.mpv_node].
         try {
           final property = 'http-header-fields'.toNativeUtf8();
           final value = calloc<generated.mpv_node>();
+          value.ref.format = generated.mpv_format.MPV_FORMAT_NONE;
           mpv.mpv_set_property(
             ctx,
             property.cast(),
             generated.mpv_format.MPV_FORMAT_NODE,
+            value.cast(),
+          );
+          calloc.free(property);
+          calloc.free(value);
+        } catch (exception, stacktrace) {
+          print(exception);
+          print(stacktrace);
+        }
+        // Set start & end position as [generated.mpv_format.MPV_FORMAT_NONE] [generated.mpv_node].
+        try {
+          final property = 'start'.toNativeUtf8();
+          final value = 'none'.toNativeUtf8();
+          mpv.mpv_set_property_string(
+            ctx,
+            property.cast(),
+            value.cast(),
+          );
+          calloc.free(property);
+          calloc.free(value);
+        } catch (exception, stacktrace) {
+          print(exception);
+          print(stacktrace);
+        }
+        try {
+          final property = 'end'.toNativeUtf8();
+          final value = 'none'.toNativeUtf8();
+          mpv.mpv_set_property_string(
+            ctx,
+            property.cast(),
             value.cast(),
           );
           calloc.free(property);
@@ -2318,6 +2486,13 @@ class NativePlayer extends PlatformPlayer {
       // keep-open = yes
       // audio-display = no
       // network-timeout = 5
+      // scale=bilinear
+      // dscale=bilinear
+      // dither=no
+      // correct-downscaling=no
+      // linear-downscaling=no
+      // sigmoid-upscaling=no
+      // hdr-compute-peak=no
       //
       // ANDROID (Physical Device OR API Level > 25):
       //
@@ -2333,6 +2508,15 @@ class NativePlayer extends PlatformPlayer {
         'keep-open': 'yes',
         'audio-display': 'no',
         'network-timeout': '5',
+        // https://github.com/mpv-player/mpv/commit/703f1588803eaa428e09c0e5547b26c0fff476a7
+        // https://github.com/mpv-android/mpv-android/commit/9e5c3d8a630290fc41edb8b03aeafa3bc4c45955
+        'scale': 'bilinear',
+        'dscale': 'bilinear',
+        'dither': 'no',
+        'correct-downscaling': 'no',
+        'linear-downscaling': 'no',
+        'sigmoid-upscaling': 'no',
+        'hdr-compute-peak': 'no',
         if (AndroidHelper.isPhysicalDevice || AndroidHelper.APILevel > 25)
           'ao': 'opensles'
         // Disable audio output on older Android emulators with API Level < 25.
@@ -2384,6 +2568,24 @@ class NativePlayer extends PlatformPlayer {
         );
         calloc.free(name);
         calloc.free(value);
+      }
+
+      if (configuration.muted) {
+        final name = 'mute'.toNativeUtf8();
+        final value = calloc<Bool>()..value = true;
+        mpv.mpv_set_property(
+          ctx,
+          name.cast(),
+          generated.mpv_format.MPV_FORMAT_FLAG,
+          value.cast(),
+        );
+        calloc.free(name);
+        calloc.free(value);
+
+        state = state.copyWith(volume: 0.0);
+        if (!volumeController.isClosed) {
+          volumeController.add(0.0);
+        }
       }
 
       // Observe the properties to update the state & feed event stream.
@@ -2454,15 +2656,13 @@ class NativePlayer extends PlatformPlayer {
     }
   }
 
-  /// Calls mpv command passed as [args]. Automatically freeds memory after command sending.
-  Future<void> _command(List<String?> args) async {
-    final List<Pointer<Utf8>> pointers = args.map<Pointer<Utf8>>((e) {
-      if (e == null) return nullptr.cast();
-      return e.toNativeUtf8();
-    }).toList();
-    final Pointer<Pointer<Utf8>> arr = calloc.allocate(args.join().length);
+  /// Calls mpv command passed as [args].
+  /// Automatically freeds memory after command sending.
+  Future<void> _command(List<String> args) async {
+    final pointers = args.map<Pointer<Utf8>>((e) => e.toNativeUtf8()).toList();
+    final arr = calloc<Pointer<Utf8>>(128);
     for (int i = 0; i < args.length; i++) {
-      arr[i] = pointers[i];
+      arr.elementAt(i).value = pointers[i];
     }
     mpv.mpv_command(
       ctx,
@@ -2505,12 +2705,8 @@ class NativePlayer extends PlatformPlayer {
   /// This is used to prevent [state.buffering] being set to `true` when [pause] or [playOrPause] is called.
   bool isBufferingStateChangeAllowed = true;
 
-  /// Currently loaded [Media]s.
-  /// This is used to prevent additional data stored in [Media] from being garbage collected.
-  ///
-  /// In summary, after loading a [Media] uri into libmpv, `playlist` is used to observe any changes & notify event [Stream].
-  /// When receiving `playlist`, the URIs are looked up internally to fetch [Media.extras] & [Media.httpHeaders] etc.
-  final HashSet<Media> current = HashSet<Media>();
+  /// Current loaded [Media] queue.
+  List<Media> current = <Media>[];
 
   /// Currently observed properties through [observeProperty].
   final HashMap<String, Future<void> Function(String)> observed =
